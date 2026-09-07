@@ -34,6 +34,8 @@
 ./scripts/install.sh
 ```
 
+也可以直接使用 DMG：双击 `ShutScreenDown.dmg`，把两个 App 拖入其中的 `Applications` 快捷方式即可完成安装。
+
 ### 方式二：从源码构建
 
 只需要 macOS 自带的 Command Line Tools（在终端运行 `xcode-select --install` 安装），不需要完整 Xcode：
@@ -66,6 +68,7 @@
 - **不碰电源设置**：本 App 不会修改任何系统电源管理设置（睡眠、唤醒、网络等均无改动）。
 - **没有外接屏时拒绝关闭内置屏**：否则你会面对一块全黑的屏幕无法操作。
 - **退出 App 时自动恢复内置屏**。
+- **拔线自动恢复时会发系统通知**：首次启动需允许通知权限，可随时在系统设置中调整。
 
 ## 屏幕全黑了怎么办
 
@@ -97,10 +100,12 @@ Sources/ShutScreenDown/           主程序（菜单栏 App）
 Sources/ShutScreenRestore/        急救工具（恢复内置屏）
 build_app.sh                      构建脚本（一条命令出两个 .app）
 scripts/install.sh                安装脚本（复制到 /Applications）
+scripts/make_dmg.sh               打包 DMG（需先运行 build_app.sh）
 scripts/probe.swift               验证系统接口是否可用
 scripts/test_toggle.swift         开关内屏 3 秒自动恢复（验证用）
 scripts/diagnose_windowserver.sh  诊断 WindowServer 卡顿（一般用不到）
 make_icon.swift                   图标生成器（构建时自动调用）
+monitor.svg                       主程序图标源文件（构建时转绘进图标）
 ```
 
 ## 致谢与出处
