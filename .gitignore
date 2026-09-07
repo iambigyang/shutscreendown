@@ -13,3 +13,7 @@ RestoreIcon.icns
 
 # macOS
 .DS_Store
+
+# DMG packaging
+*.dmg
+.dmg_stage/
