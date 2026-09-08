@@ -56,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
             reason: "保持显示器事件与看门狗实时响应")
-        logger.log("启动。intentDisabled=\(store.state.intentDisabled) autoMode=\(store.state.autoMode) pendingReapply=\(store.state.pendingReapply) autoHold=\(store.state.autoHold)")
+        logger.log("启动。intentDisabled=\(store.state.intentDisabled) autoMode=\(store.state.autoMode) pendingReapply=\(store.state.pendingReapply) autoHold=\(store.state.autoHold) disabledExternals=[\(store.state.disabledExternals.sorted().map(String.init).joined(separator: ","))]")
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
@@ -102,13 +102,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 批量恢复：内置屏 + 集合中所有外接 + 物理在连但暗着的孤儿，
+    /// 批量恢复：内置屏 + 集合中「物理在连」的外接 + 物理在连但暗着的孤儿，
     /// 单次配置事务（避免 N 次闪烁）。退出契约：全部亮着离开。
     private func restoreAllDisplays() {
+        let physical = Set(controller.physicallyConnectedExternals())
         var targets = controller.builtinDisplay().map { [$0] } ?? []
-        targets.append(contentsOf: store.state.disabledExternals.map { CGDirectDisplayID($0) })
-        for d in controller.physicallyConnectedExternals()
-            where !targets.contains(d) && CGDisplayIsActive(d) == 0 {
+        // 集合成员必须过滤为「物理在连」：幽灵 ID 会让配置事务整体失败，
+        // 导致一次都恢复不了（退出黑屏风险），宁可少恢复也不能全失败。
+        for extID in store.state.disabledExternals {
+            let d = CGDirectDisplayID(extID)
+            if physical.contains(d), !targets.contains(d) {
+                targets.append(d)
+            }
+        }
+        for d in physical where !targets.contains(d) && CGDisplayIsActive(d) == 0 {
             targets.append(d)
         }
         guard !targets.isEmpty else { return }
@@ -252,14 +259,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // F. 外接意图维护（先于内置屏分支：顺序裁决写死，终态与事件顺序无关）
+        let physicalExternals = controller.physicallyConnectedExternals()
         if !s.disabledExternals.isEmpty {
             let onlineIDs = Set(controller.onlineDisplays())
-            let allIDs = Set(controller.allDisplays())
+            let physicalIDs = Set(physicalExternals)
             var removed: [UInt32] = []
             for extID in s.disabledExternals {
                 let d = CGDirectDisplayID(extID)
-                guard allIDs.contains(d) || onlineIDs.contains(d) else {
-                    removed.append(extID)   // 物理消失（不在 all 且不在 online）→ 剔除
+                // 剔除：不在线且无物理连接（物理拔出，或扩展坞残留的幽灵 ID）
+                guard onlineIDs.contains(d) || physicalIDs.contains(d) else {
+                    removed.append(extID)
                     continue
                 }
                 // 未点亮（active=0）或休眠中 → 无需动作
@@ -294,7 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // F2. 孤儿治愈：物理在连、未点亮、也不在集合中的外接（集合曾被剔除，
         // 但系统会话配置仍维持禁用）→ 恢复为亮，使现实与意图（未要求关闭）一致。
         if !screensAsleep && Date().timeIntervalSince(lastExternalHealAttempt) > 10 {
-            for d in controller.physicallyConnectedExternals()
+            for d in physicalExternals
                 where !s.disabledExternals.contains(UInt32(d))
                     && CGDisplayIsActive(d) == 0
                     && CGDisplayIsAsleep(d) == 0 {
@@ -309,10 +318,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // A. 自动模式：可用外显在、内屏亮着、用户没压着 → 自动关
         if s.autoMode && !s.autoHold && hasUsableExt && builtinActive {
-            if controller.disableBuiltin().isSuccess {
+            let r = controller.disableBuiltin()
+            if r.isSuccess {
                 s.intentDisabled = true
                 changed = true
                 logger.log("\(reason)：自动模式关闭内置屏")
+            } else {
+                logger.log("\(reason)：自动模式关闭失败：\(r.message)")
             }
         }
 
@@ -321,9 +333,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if hasUsableExt {
                 // 可用外显在但内屏被系统点亮（唤醒 / 开盖）→ 立即重新关掉
                 if builtinActive {
-                    if controller.disableBuiltin().isSuccess {
+                    let r = controller.disableBuiltin()
+                    if r.isSuccess {
                         changed = true
                         logger.log("\(reason)：内屏被点亮，重新关闭")
+                    } else {
+                        logger.log("\(reason)：内屏重关失败：\(r.message)")
                     }
                 }
             } else if !screensAsleep {
@@ -357,11 +372,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // C. 重插记忆（手动模式）：拔线被迫恢复后，外显回来 → 自动重新关闭
         if !changed && s.pendingReapply && hasUsableExt {
             if builtinActive {
-                if controller.disableBuiltin().isSuccess {
+                let r = controller.disableBuiltin()
+                if r.isSuccess {
                     s.pendingReapply = false
                     s.intentDisabled = true
                     changed = true
                     logger.log("\(reason)：外显重连，重新关闭内置屏（重插记忆）")
+                } else {
+                    logger.log("\(reason)：重插重关失败：\(r.message)")
                 }
             } else {
                 s.pendingReapply = false
@@ -446,9 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateIcon() {
         let off = store.state.intentDisabled || !controller.isBuiltinActive()
-        let symbol = off ? "laptopcomputer.slash" : "laptopcomputer"
-        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "熄内屏") {
-            img.isTemplate = true
+        if let img = MenuBarIcon.image(off: off) {
             statusItem.button?.image = img
             statusItem.button?.title = ""
         } else {
@@ -563,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         about.target = self
         menu.addItem(about)
 
-        let quitItem = NSMenuItem(title: "退出（自动恢复内置屏）",
+        let quitItem = NSMenuItem(title: "退出（自动恢复全部显示器）",
                                   action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)

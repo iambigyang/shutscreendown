@@ -241,6 +241,8 @@ final class DisplayController {
         for d in displays {
             let e = fn(config, d, true)
             if e != .success {
+                // 1001 且已处于启用状态 = 无操作成功，继续处理其余显示器
+                if e.rawValue == 1001 && CGDisplayIsActive(d) != 0 { continue }
                 CGCancelDisplayConfiguration(config)
                 return .configureFailed(e.rawValue)
             }
@@ -274,6 +276,11 @@ final class DisplayController {
         let e = fn(config, display, enabled)
         if e != .success {
             CGCancelDisplayConfiguration(config)
+            // macOS 26 实测：对「已处于目标状态」的显示器执行配置返回 CGError 1001
+            // （对已禁用的屏再禁用、对已启用的屏再启用）。此时目标状态已达成，视为成功。
+            let alreadyThere = enabled ? (CGDisplayIsActive(display) != 0)
+                                       : (CGDisplayIsActive(display) == 0)
+            if e.rawValue == 1001 && alreadyThere { return .ok }
             return .configureFailed(e.rawValue)
         }
 
