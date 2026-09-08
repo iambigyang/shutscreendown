@@ -449,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard Bundle.main.bundleIdentifier != nil else { return }   // 开发态（未打包）不发
         logger.log("发出恢复通知")
         let content = UNMutableNotificationContent()
-        content.title = "熄内屏"
+        content.title = "熄屏"
         content.body = "外接显示器已断开，内置屏已恢复。"
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
@@ -647,10 +647,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() {
         let a = NSAlert()
-        a.messageText = "熄内屏 — 开盖只用外接显示器"
+        a.messageText = "熄屏 — 单独开关任意显示器"
         a.informativeText = """
-        盖子开着也能只用外接显示器（等效合盖模式），
-        摄像头、Touch ID、键盘、散热均不受影响。
+        可以单独熄灭或点亮任意一块屏幕：
+        关内置屏开盖只用外接显示器（等效合盖模式，
+        摄像头、Touch ID、键盘、散热均不受影响），
+        或关掉暂时不用的外接屏。
 
         行为约定：
         • 以内置屏开关状态为准：合盖、开盖都不会改变你的设置。

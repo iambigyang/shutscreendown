@@ -19,6 +19,6 @@ cp -R "$ROOT/RecoveryScreen.app" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
 echo "==> 打包 DMG ..."
-hdiutil create -volname "熄内屏" -srcfolder "$STAGE" -ov -format UDZO "$OUT" >/dev/null
+hdiutil create -volname "熄屏" -srcfolder "$STAGE" -ov -format UDZO "$OUT" >/dev/null
 rm -rf "$STAGE"
 echo "==> 完成：$OUT"

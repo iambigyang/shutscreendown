@@ -5,7 +5,7 @@
     <key>CFBundleName</key>
     <string>ShutScreenDown</string>
     <key>CFBundleDisplayName</key>
-    <string>熄内屏</string>
+    <string>熄屏</string>
     <key>CFBundleIdentifier</key>
     <string>com.shutscreendown.app</string>
     <key>CFBundleVersion</key>
