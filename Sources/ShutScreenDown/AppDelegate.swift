@@ -15,6 +15,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastTopo: String?
     /// 治愈分支（E）上次尝试时间，用于限频
     private var lastHealAttempt = Date(timeIntervalSince1970: 0)
+    /// F 分支限频：上次尝试重关外接的时间
+    private var lastExternalReapplyAttempt = Date(timeIntervalSince1970: 0)
+    /// F2 孤儿治愈限频：上次尝试治愈的时间
+    private var lastExternalHealAttempt = Date(timeIntervalSince1970: 0)
+    /// F 分支连续被安全闸拒绝的次数（≥3 采纳现实并通知）
+    private var externalReapplyRejections = 0
+    /// 菜单状态签名：仅变化时重建菜单，防止看门狗刷新导致菜单展开时闪动
+    private var lastMenuSignature: String?
+    /// 显示器显示名缓存：关屏后显示器不在线，NSScreen 查不到名字，用缓存兜底
+    private var displayNameCache: [CGDirectDisplayID: String] = [:]
+
+    /// 显示器显示名：优先系统型号名（NSScreen.localizedName，如「Kuycon G27P」）；
+    /// 离线（被禁用）时用缓存；都拿不到时用分辨率或厂商/型号编号兜底。
+    private func displayName(for d: CGDirectDisplayID) -> String {
+        if let cached = displayNameCache[d], !cached.isEmpty { return cached }
+        for screen in NSScreen.screens {
+            let num = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            if num == d, !screen.localizedName.isEmpty {
+                displayNameCache[d] = screen.localizedName
+                return screen.localizedName
+            }
+        }
+        let w = CGDisplayPixelsWide(d)
+        let h = CGDisplayPixelsHigh(d)
+        if w > 1 && h > 1 { return "\(w)×\(h)" }
+        return String(format: "%04X:%04X", CGDisplayVendorNumber(d), CGDisplayModelNumber(d))
+    }
     /// 系统是否处于「显示休眠」状态（所有屏幕睡觉）。
     /// 此时绝不点亮内置屏——否则空闲时会误伤（用户没动电脑，内屏自己亮了）。
     private var screensAsleep = false
@@ -62,16 +89,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // 兜底：经其它途径终止（非菜单退出）时也恢复内置屏。
+        // 兜底：经其它途径终止（非菜单退出）时也恢复所有显示器。
         // 无条件恢复：意图可能与现实脱节（唤醒过渡期系统可能重放旧配置），
-        // 退出契约是「内置屏亮着离开」，以现实为准（幂等，无副作用）。
-        controller.enableBuiltin()
-        logger.log("进程终止：恢复内置屏")
+        // 退出契约是「全部亮着离开」，以现实为准（幂等，无副作用）。
+        restoreAllDisplays()
+        logger.log("进程终止：恢复全部显示器")
         store.update { s in
             s.intentDisabled = false
             s.pendingReapply = false
             s.autoHold = false
+            s.disabledExternals = []
         }
+    }
+
+    /// 批量恢复：内置屏 + 集合中所有外接 + 物理在连但暗着的孤儿，
+    /// 单次配置事务（避免 N 次闪烁）。退出契约：全部亮着离开。
+    private func restoreAllDisplays() {
+        var targets = controller.builtinDisplay().map { [$0] } ?? []
+        targets.append(contentsOf: store.state.disabledExternals.map { CGDirectDisplayID($0) })
+        for d in controller.physicallyConnectedExternals()
+            where !targets.contains(d) && CGDisplayIsActive(d) == 0 {
+            targets.append(d)
+        }
+        guard !targets.isEmpty else { return }
+        let r = controller.enableAll(displays: targets)
+        logger.log("批量恢复显示器 \(targets.count) 台：\(r.message)")
     }
 
     // MARK: - 手动动作
@@ -86,11 +128,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 s.autoHold = false
             }
             logger.log("手动关闭内置屏")
+        case .wouldBlackout:
+            logger.log("手动关闭内置屏被安全闸拒绝")
+            notify("无法关闭内置屏", r.message)
         case .noExternal:
             notify("无法关闭内置屏", "请先连接外接显示器，否则屏幕会全黑、无法操作。")
         default:
             logger.log("手动关闭失败：\(r.message)")
             notify("关闭失败", r.message)
+        }
+        refresh()
+    }
+
+    /// 列表动作：关闭某台外接显示器（统一安全闸拦截最后一块可见屏）。
+    @objc private func extDisable(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? CGDirectDisplayID else { return }
+        let r = controller.disable(display: d)
+        switch r {
+        case .ok:
+            store.update { $0.disabledExternals.insert(UInt32(d)) }
+            logger.log("手动关闭外接显示器 \(d)")
+        case .wouldBlackout:
+            logger.log("关闭外接 \(d) 被安全闸拒绝")
+            notify("无法关闭", r.message)
+        default:
+            logger.log("关闭外接 \(d) 失败：\(r.message)")
+            notify("关闭失败", r.message)
+        }
+        refresh()
+    }
+
+    /// 列表动作：开启某台外接显示器。
+    @objc private func extEnable(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? CGDirectDisplayID else { return }
+        let r = controller.enable(display: d)
+        logger.log("手动开启外接显示器 \(d)：\(r.message)")
+        if r.isSuccess {
+            store.update { $0.disabledExternals.remove(UInt32(d)) }
+        } else {
+            notify("开启失败", r.message)
         }
         refresh()
     }
@@ -141,12 +217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logger.log("用户选择退出")
         // 顺序重要：先恢复屏幕、清状态，再 bootout —— bootout 会立刻终止本进程，
         // 走不到后面的代码，所以恢复动作必须放在它前面。
-        // 无条件恢复：退出契约是「内置屏亮着离开」，以现实为准（幂等）。
-        controller.enableBuiltin()
+        // 无条件恢复：退出契约是「所有显示器亮着离开」，以现实为准（幂等）。
+        restoreAllDisplays()
         store.update { s in
             s.intentDisabled = false
             s.pendingReapply = false
             s.autoHold = false
+            s.disabledExternals = []
         }
         if LaunchAgentController.isBootstrapped() {
             logger.log("运行于 launchd，bootout 后退出（防止被 KeepAlive 拉起）")
@@ -168,10 +245,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var changed = false
 
         // 拓扑变化记录（仅变化时）：用于排查「事件是否被观察到」「幽灵显示器」类问题
-        let topo = "可用外显\(hasUsableExt ? "有" : "无")/内置\(builtinActive ? "亮" : "熄")/盖子\(lidClosed.map { $0 ? "关" : "开" } ?? "?")/休眠\(screensAsleep ? "是" : "否")/[\(controller.describeDisplays())]"
+        let topo = "可用外显\(hasUsableExt ? "有" : "无")/内置\(builtinActive ? "亮" : "熄")/盖子\(lidClosed.map { $0 ? "关" : "开" } ?? "?")/休眠\(screensAsleep ? "是" : "否")/集合[\(s.disabledExternals.sorted().map(String.init).joined(separator: ","))]/[\(controller.describeDisplays())]"
         if topo != lastTopo {
             logger.log("\(reason)：拓扑 \(topo)")
             lastTopo = topo
+        }
+
+        // F. 外接意图维护（先于内置屏分支：顺序裁决写死，终态与事件顺序无关）
+        if !s.disabledExternals.isEmpty {
+            let onlineIDs = Set(controller.onlineDisplays())
+            let allIDs = Set(controller.allDisplays())
+            var removed: [UInt32] = []
+            for extID in s.disabledExternals {
+                let d = CGDirectDisplayID(extID)
+                guard allIDs.contains(d) || onlineIDs.contains(d) else {
+                    removed.append(extID)   // 物理消失（不在 all 且不在 online）→ 剔除
+                    continue
+                }
+                // 未点亮（active=0）或休眠中 → 无需动作
+                guard !screensAsleep,
+                      CGDisplayIsAsleep(d) == 0,
+                      CGDisplayIsActive(d) != 0 else { continue }
+                // 限频 10s，防系统反复重放配置导致的 commit 风暴
+                guard Date().timeIntervalSince(lastExternalReapplyAttempt) > 10 else { continue }
+                lastExternalReapplyAttempt = Date()
+                let r = controller.disable(display: d)
+                if r.isSuccess {
+                    externalReapplyRejections = 0
+                    changed = true
+                    logger.log("\(reason)：外接 \(d) 被点亮，重新关闭")
+                } else {
+                    externalReapplyRejections += 1
+                    logger.log("\(reason)：外接 \(d) 重关被拒（\(r.message)），第 \(externalReapplyRejections) 次")
+                    if externalReapplyRejections >= 3 {
+                        removed.append(extID)   // 连续被拒 → 采纳现实
+                        externalReapplyRejections = 0
+                        notify("外接显示器状态已更新", "无法维持显示器 \(d) 的关闭状态，已按系统状态恢复为开启。")
+                    }
+                }
+            }
+            if !removed.isEmpty {
+                s.disabledExternals.subtract(removed)
+                changed = true
+                logger.log("\(reason)：外接集合剔除 \(removed)")
+            }
+        }
+
+        // F2. 孤儿治愈：物理在连、未点亮、也不在集合中的外接（集合曾被剔除，
+        // 但系统会话配置仍维持禁用）→ 恢复为亮，使现实与意图（未要求关闭）一致。
+        if !screensAsleep && Date().timeIntervalSince(lastExternalHealAttempt) > 10 {
+            for d in controller.physicallyConnectedExternals()
+                where !s.disabledExternals.contains(UInt32(d))
+                    && CGDisplayIsActive(d) == 0
+                    && CGDisplayIsAsleep(d) == 0 {
+                lastExternalHealAttempt = Date()
+                if controller.enable(display: d).isSuccess {
+                    changed = true
+                    logger.log("\(reason)：孤儿外接 \(d) 治愈恢复")
+                }
+                break   // 一次只处理一台，避免单次 evaluate 过多配置操作
+            }
         }
 
         // A. 自动模式：可用外显在、内屏亮着、用户没压着 → 自动关
@@ -324,8 +457,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func rebuildMenu() {
+    private func rebuildMenu(force: Bool = false) {
         guard let menu = statusItem.menu else { return }
+        // 状态签名比对：看门狗每 1.5s 调 refresh，签名未变则不重建，防止菜单展开时闪动
+        let signature = menuSignature()
+        if !force, signature == lastMenuSignature { return }
+        lastMenuSignature = signature
         menu.removeAllItems()
 
         let hasExt = controller.hasExternalDisplay()
@@ -356,13 +493,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addInfo(menu, lidText)
         menu.addItem(.separator())
 
-        // —— 主开关 ——
+        // —— 显示器列表 ——
+        addInfo(menu, "显示器：")
+        // 内置屏行：仅展示状态（开关用下方主开关 / 自动模式）
+        let builtinRow = NSMenuItem(title: "  内置显示器（\(builtinActive ? "开" : "关")）",
+                                    action: nil, keyEquivalent: "")
+        builtinRow.isEnabled = false
+        builtinRow.toolTip = s.intentDisabled ? "意图：保持关闭" : "意图：保持开启"
+        menu.addItem(builtinRow)
+        // 外接屏行：仅显示「在线外接 + 被 App 关闭（集合）的外接」，
+        // 隐藏扩展坞残留的 1x1 幽灵条目（allDisplays 里的假显示器）。
+        var shown = Set<CGDirectDisplayID>()
+        for d in controller.externalDisplays() {
+            shown.insert(d)
+            menu.addItem(externalMenuItem(display: d, state: s))
+        }
+        for extID in s.disabledExternals.sorted() {
+            let d = CGDirectDisplayID(extID)
+            if !shown.contains(d) {
+                shown.insert(d)
+                menu.addItem(externalMenuItem(display: d, state: s))
+            }
+        }
+        menu.addItem(.separator())
+
+        // —— 主开关（内置屏） ——
         if builtinActive {
             let item = NSMenuItem(title: "关闭内置屏（只用外接）",
                                   action: #selector(disable), keyEquivalent: "d")
             item.target = self
-            item.isEnabled = hasExt && controller.isAPIAvailable
-            if !hasExt { item.toolTip = "需要先连接外接显示器" }
+            // 用统一安全闸而非 hasExternalDisplay：关掉全部外接后主开关必须不可用
+            let canDisable = controller.builtinDisplay()
+                .map { !controller.wouldLeaveNoVisibleScreen($0) } ?? false
+            item.isEnabled = canDisable && controller.isAPIAvailable
+            if !canDisable { item.toolTip = "没有其它可见屏幕，无法关闭" }
             menu.addItem(item)
         } else {
             let item = NSMenuItem(title: "恢复内置屏",
@@ -411,6 +575,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
+    /// 外接显示器行：标题带真实型号名与现实状态，子菜单提供关闭/开启动作。
+    private func externalMenuItem(display d: CGDirectDisplayID, state s: AppState) -> NSMenuItem {
+        _ = displayName(for: d)   // 在线时预热名称缓存（关屏后离线也能显示名字）
+        let active = CGDisplayIsActive(d) != 0
+        let online = controller.onlineDisplays().contains(d)
+        let inSet = s.disabledExternals.contains(UInt32(d))
+        let title = "  " + displayName(for: d)
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        // 防御分支：正常构建流程不会走到（行只来自在线或集合），残留保护
+        if !online && !active && !inSet {
+            item.title = title + "（已断开）"
+            item.isEnabled = false
+            item.toolTip = "物理连接已断开"
+            return item
+        }
+        item.title = title + (active ? "（开）" : "（关）")
+        item.toolTip = inSet ? "意图：关闭" : (active ? "已开启" : "系统未点亮")
+
+        let sub = NSMenu()
+        let offItem = NSMenuItem(title: "关闭此显示器", action: #selector(extDisable(_:)), keyEquivalent: "")
+        offItem.target = self
+        offItem.representedObject = d
+        offItem.isEnabled = active
+        sub.addItem(offItem)
+        let onItem = NSMenuItem(title: "开启此显示器", action: #selector(extEnable(_:)), keyEquivalent: "")
+        onItem.target = self
+        onItem.representedObject = d
+        onItem.isEnabled = !active || inSet
+        sub.addItem(onItem)
+        item.submenu = sub
+        return item
+    }
+
+    /// 菜单状态签名：与上次相同则跳过重建。
+    private func menuSignature() -> String {
+        let s = store.state
+        return [
+            String(controller.isAPIAvailable),
+            String(controller.isBuiltinActive()),
+            String(controller.externalDisplays().count),
+            String(controller.hasUsableExternalDisplay()),
+            String(describing: LidState.isClosed()),
+            String(s.intentDisabled),
+            String(s.autoMode),
+            String(s.autoHold),
+            String(s.pendingReapply),
+            String(LaunchAgentController.isInstalled()),
+            String(Bundle.main.bundlePath.hasSuffix(".app")),
+            s.disabledExternals.sorted().map(String.init).joined(separator: ","),
+            controller.describeDisplays(),
+        ].joined(separator: "|")
+    }
+
     @objc private func showAbout() {
         let a = NSAlert()
         a.messageText = "熄内屏 — 开盖只用外接显示器"
@@ -421,8 +639,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         行为约定：
         • 以内置屏开关状态为准：合盖、开盖都不会改变你的设置。
           设为「关」时，开盖瞬间屏幕亮一下后会自动重新关掉。
+        • 显示器列表可单独关闭/开启任意外接显示器；
+          最后一块可见屏幕永远无法被关闭。
         • 没外接显示器时不会关闭内置屏；拔掉外接会自动恢复。
-        • 退出 App 会自动恢复内置屏。
+        • 退出 App 会自动恢复所有被关闭的显示器。
 
         万一屏幕全黑：
         1. 拔掉外接显示器（App 会自动恢复内置屏）
@@ -447,5 +667,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: NSMenuDelegate {
-    func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
+    func menuWillOpen(_ menu: NSMenu) { rebuildMenu(force: true) }
 }

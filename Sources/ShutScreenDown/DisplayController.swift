@@ -100,14 +100,30 @@ final class DisplayController {
         return externalDisplays().filter { d in
             guard CGDisplayIsAsleep(d) == 0 else { return false }
             guard let livePrefixes else { return true }
-            let v = CGDisplayVendorNumber(d)
-            let p = CGDisplayModelNumber(d)
-            let prefix = String(format: "%04X%02X%02X", v, p & 0xFF, (p >> 8) & 0xFF)
-            return livePrefixes.contains(prefix)
+            return livePrefixes.contains(vendorProductPrefix(d))
         }
     }
 
     func hasUsableExternalDisplay() -> Bool { !usableExternalDisplays().isEmpty }
+
+    /// 物理在连的外接显示器（**含被禁用的**）：在 allDisplays 中且厂商/产品号
+    /// 与 DCP 端口的 EDID 匹配。用于识别「孤儿」——集合成员被剔除后，
+    /// 系统会话配置仍维持禁用状态的显示器（App 失忆但屏幕还黑着）。
+    func physicallyConnectedExternals() -> [CGDirectDisplayID] {
+        let livePrefixes = liveDCPEdidPrefixes()
+        return allDisplays().filter { d in
+            guard CGDisplayIsBuiltin(d) == 0 else { return false }
+            guard let livePrefixes else { return true }
+            return livePrefixes.contains(vendorProductPrefix(d))
+        }
+    }
+
+    /// 显示器厂商+产品号 → EDID UUID 前缀（与 DCP 端口服务的 EDID UUID 前 8 位对应）。
+    private func vendorProductPrefix(_ d: CGDirectDisplayID) -> String {
+        let v = CGDisplayVendorNumber(d)
+        let p = CGDisplayModelNumber(d)
+        return String(format: "%04X%02X%02X", v, p & 0xFF, (p >> 8) & 0xFF)
+    }
 
     /// 收集物理在连的 DCP 外接端口的 EDID UUID 前缀。见 usableExternalDisplays 注释。
     private func liveDCPEdidPrefixes() -> Set<String>? {
@@ -153,7 +169,8 @@ final class DisplayController {
         case ok
         case apiMissing
         case noBuiltin
-        case noExternal           // 安全拦截：没有外接显示器，拒绝关闭内置（否则全黑无法操作）
+        case noExternal           // 已废弃，保留枚举值以兼容日志（现由 wouldBlackout 统一拦截）
+        case wouldBlackout        // 统一安全闸拦截：关闭后将无任何可见屏幕
         case beginFailed(Int32)
         case configureFailed(Int32)
         case completeFailed(Int32)
@@ -166,6 +183,7 @@ final class DisplayController {
             case .apiMissing:           return "当前系统不支持该接口"
             case .noBuiltin:            return "未找到内置显示器"
             case .noExternal:           return "没有外接显示器，已拒绝（否则会全黑）"
+            case .wouldBlackout:        return "这是最后一块可见屏幕，已拒绝关闭（否则会全黑无法操作）"
             case .beginFailed(let e):   return "开始配置失败 (CGError \(e))"
             case .configureFailed(let e): return "设置失败 (CGError \(e))"
             case .completeFailed(let e):  return "应用配置失败 (CGError \(e))"
@@ -173,23 +191,77 @@ final class DisplayController {
         }
     }
 
+    // MARK: - 统一安全闸
+
+    /// 关闭 `display` 后，剩余「可见」显示器数量。
+    /// 可见谓词 = active 且（外接需非休眠且物理在连，走 EDID 检测）。
+    /// 用 active 而非 online：被禁用的显示器不在 online 列表，若按 online 计数
+    /// 会出现「关掉外接 A 后仍可关内置屏 → 全黑」的黑洞组合。
+    func visibleDisplaysExcluding(_ display: CGDirectDisplayID) -> Int {
+        var count = 0
+        if let b = builtinDisplay(), b != display, CGDisplayIsActive(b) != 0 {
+            count += 1
+        }
+        for d in usableExternalDisplays() where d != display && CGDisplayIsActive(d) != 0 {
+            count += 1
+        }
+        return count
+    }
+
+    /// 关闭该屏后是否无任何可见屏幕（安全闸谓词）。
+    func wouldLeaveNoVisibleScreen(_ display: CGDirectDisplayID) -> Bool {
+        visibleDisplaysExcluding(display) == 0
+    }
+
     // MARK: - 操作
 
-    /// 关闭内置屏。**仅当存在在线外接显示器时**才会执行，否则返回 `.noExternal`。
+    /// 关闭任意一台显示器。**所有关闭路径（手动/自动/重关）都必须经过此闸**。
+    @discardableResult
+    func disable(display: CGDirectDisplayID) -> Result {
+        guard let fn = configureEnabled else { return .apiMissing }
+        guard !wouldLeaveNoVisibleScreen(display) else { return .wouldBlackout }
+        return apply(fn, display: display, enabled: false)
+    }
+
+    /// 恢复任意一台显示器。
+    @discardableResult
+    func enable(display: CGDirectDisplayID) -> Result {
+        guard let fn = configureEnabled else { return .apiMissing }
+        return apply(fn, display: display, enabled: true)
+    }
+
+    /// 批量恢复多台显示器（单次配置事务，避免 N 次 commit 造成 N 次全屏闪烁）。
+    @discardableResult
+    func enableAll(displays: [CGDirectDisplayID]) -> Result {
+        guard let fn = configureEnabled else { return .apiMissing }
+        guard !displays.isEmpty else { return .ok }
+        var config: CGDisplayConfigRef?
+        let begin = CGBeginDisplayConfiguration(&config)
+        if begin != .success { return .beginFailed(begin.rawValue) }
+        for d in displays {
+            let e = fn(config, d, true)
+            if e != .success {
+                CGCancelDisplayConfiguration(config)
+                return .configureFailed(e.rawValue)
+            }
+        }
+        let complete = CGCompleteDisplayConfiguration(config, .forSession)
+        if complete != .success { return .completeFailed(complete.rawValue) }
+        return .ok
+    }
+
+    /// 关闭内置屏（统一安全闸负责拦截「无其它可见屏」的场景）。
     @discardableResult
     func disableBuiltin() -> Result {
-        guard let fn = configureEnabled else { return .apiMissing }
         guard let builtin = builtinDisplay() else { return .noBuiltin }
-        guard hasExternalDisplay() else { return .noExternal }
-        return apply(fn, display: builtin, enabled: false)
+        return disable(display: builtin)
     }
 
     /// 恢复内置屏
     @discardableResult
     func enableBuiltin() -> Result {
-        guard let fn = configureEnabled else { return .apiMissing }
         guard let builtin = builtinDisplay() else { return .noBuiltin }
-        return apply(fn, display: builtin, enabled: true)
+        return enable(display: builtin)
     }
 
     private func apply(_ fn: ConfigureDisplayEnabledFn,
