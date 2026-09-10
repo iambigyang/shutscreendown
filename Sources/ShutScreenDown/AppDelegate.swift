@@ -135,6 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 s.autoHold = false
             }
             logger.log("手动关闭内置屏")
+        case .alreadyInState:
+            logger.log("内置屏已是关闭状态，忽略重复操作")
+            notify("内置屏已是关闭状态", "当前已经是关闭状态，无需重复操作。")
         case .wouldBlackout:
             logger.log("手动关闭内置屏被安全闸拒绝")
             notify("无法关闭内置屏", r.message)
@@ -155,6 +158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .ok:
             store.update { $0.disabledExternals.insert(UInt32(d)) }
             logger.log("手动关闭外接显示器 \(d)")
+        case .alreadyInState:
+            logger.log("外接 \(d) 已是关闭状态，忽略重复操作")
+            notify("\(displayName(for: d)) 已是关闭状态", "当前已经是关闭状态，无需重复操作。")
         case .wouldBlackout:
             logger.log("关闭外接 \(d) 被安全闸拒绝")
             notify("无法关闭", r.message)
@@ -172,6 +178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logger.log("手动开启外接显示器 \(d)：\(r.message)")
         if r.isSuccess {
             store.update { $0.disabledExternals.remove(UInt32(d)) }
+            if r == .alreadyInState {
+                notify("\(displayName(for: d)) 已是开启状态", "当前已经是开启状态，无需重复操作。")
+            }
         } else {
             notify("开启失败", r.message)
         }
@@ -181,6 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func enable() {
         let r = controller.enableBuiltin()
         logger.log("手动恢复内置屏：\(r.message)")
+        if r == .alreadyInState {
+            notify("内置屏已是开启状态", "当前已经是开启状态，无需重复操作。")
+            refresh()
+            return
+        }
         if !r.isSuccess {
             notify("恢复失败", "\(r.message)\n\n若屏幕仍黑，可用「恢复内置屏」急救工具，或合盖再开盖、注销重启恢复。")
             refresh()
@@ -247,7 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard controller.isAPIAvailable else { refresh(); return }
         var s = store.state
         let hasUsableExt = controller.hasUsableExternalDisplay()
-        let builtinActive = controller.isBuiltinActive()
+        var builtinActive = controller.isBuiltinActive()   // 可变：每次操作后同步刷新，避免同一轮重复操作同一块屏
         let lidClosed = LidState.isClosed()
         var changed = false
 
@@ -322,6 +336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if r.isSuccess {
                 s.intentDisabled = true
                 changed = true
+                builtinActive = controller.isBuiltinActive()
                 logger.log("\(reason)：自动模式关闭内置屏")
             } else {
                 logger.log("\(reason)：自动模式关闭失败：\(r.message)")
@@ -336,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let r = controller.disableBuiltin()
                     if r.isSuccess {
                         changed = true
+                        builtinActive = controller.isBuiltinActive()
                         logger.log("\(reason)：内屏被点亮，重新关闭")
                     } else {
                         logger.log("\(reason)：内屏重关失败：\(r.message)")
@@ -346,7 +362,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if builtinActive {
                     // macOS 在拔线时已自行点亮内屏（原生兜底）→ 采纳为开启，
                     // 同时把「启用」写回会话配置，防止唤醒过渡期系统重放旧的禁用配置
-                    _ = controller.enableBuiltin()
+                    if let b = controller.builtinDisplay() {
+                        _ = controller.writeBackEnabled(display: b)
+                    }
                     s.intentDisabled = false
                     if !s.autoMode { s.pendingReapply = true }   // 手动模式：记下重插记忆
                     changed = true
@@ -359,6 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         s.intentDisabled = false
                         if !s.autoMode { s.pendingReapply = true }   // 手动模式：记下重插记忆
                         changed = true
+                        builtinActive = controller.isBuiltinActive()
                         logger.log("\(reason)：无外显且开盖，安全恢复内置屏")
                         notifyRestored()
                     } else {
@@ -511,12 +530,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // —— 显示器列表 ——
         addInfo(menu, "显示器：")
-        // 内置屏行：仅展示状态（开关用下方主开关 / 自动模式）
-        let builtinRow = NSMenuItem(title: "  内置显示器（\(builtinActive ? "开" : "关")）",
-                                    action: nil, keyEquivalent: "")
-        builtinRow.isEnabled = false
-        builtinRow.toolTip = s.intentDisabled ? "意图：保持关闭" : "意图：保持开启"
-        menu.addItem(builtinRow)
+        // 内置屏行：与外接屏行同构，展开子菜单可单独开关（无内置屏的机型如 Mac mini 不显示此行）
+        if controller.builtinDisplay() != nil {
+            menu.addItem(builtinMenuItem(state: s))
+        }
         // 外接屏行：仅显示「在线外接 + 被 App 关闭（集合）的外接」，
         // 隐藏扩展坞残留的 1x1 幽灵条目（allDisplays 里的假显示器）。
         var shown = Set<CGDirectDisplayID>()
@@ -530,26 +547,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 shown.insert(d)
                 menu.addItem(externalMenuItem(display: d, state: s))
             }
-        }
-        menu.addItem(.separator())
-
-        // —— 主开关（内置屏） ——
-        if builtinActive {
-            let item = NSMenuItem(title: "关闭内置屏（只用外接）",
-                                  action: #selector(disable), keyEquivalent: "d")
-            item.target = self
-            // 用统一安全闸而非 hasExternalDisplay：关掉全部外接后主开关必须不可用
-            let canDisable = controller.builtinDisplay()
-                .map { !controller.wouldLeaveNoVisibleScreen($0) } ?? false
-            item.isEnabled = canDisable && controller.isAPIAvailable
-            if !canDisable { item.toolTip = "没有其它可见屏幕，无法关闭" }
-            menu.addItem(item)
-        } else {
-            let item = NSMenuItem(title: "恢复内置屏",
-                                  action: #selector(enable), keyEquivalent: "e")
-            item.target = self
-            item.isEnabled = controller.isAPIAvailable
-            menu.addItem(item)
         }
         menu.addItem(.separator())
 
@@ -589,6 +586,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         menu.addItem(item)
+    }
+
+    /// 内置显示器行：与外接屏行同构，子菜单提供关闭/开启动作。
+    private func builtinMenuItem(state s: AppState) -> NSMenuItem {
+        let active = controller.isBuiltinActive()
+        let item = NSMenuItem(title: "  内置显示器（\(active ? "开" : "关")）",
+                              action: nil, keyEquivalent: "")
+        item.toolTip = s.intentDisabled ? "意图：保持关闭" : "意图：保持开启"
+
+        // 用统一安全闸而非 hasExternalDisplay：关掉全部外接后此开关必须不可用
+        let canDisable = controller.builtinDisplay()
+            .map { !controller.wouldLeaveNoVisibleScreen($0) } ?? false
+
+        let sub = NSMenu()
+        let offItem = NSMenuItem(title: "关闭内置屏", action: #selector(disable), keyEquivalent: "d")
+        offItem.target = self
+        offItem.isEnabled = active && canDisable && controller.isAPIAvailable
+        offItem.toolTip = canDisable ? "关闭后只用外接显示器" : "没有其它可见屏幕，无法关闭"
+        sub.addItem(offItem)
+        let onItem = NSMenuItem(title: "开启内置屏", action: #selector(enable), keyEquivalent: "e")
+        onItem.target = self
+        onItem.isEnabled = !active && controller.isAPIAvailable
+        sub.addItem(onItem)
+        item.submenu = sub
+        return item
     }
 
     /// 外接显示器行：标题带真实型号名与现实状态，子菜单提供关闭/开启动作。
@@ -657,7 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         行为约定：
         • 以内置屏开关状态为准：合盖、开盖都不会改变你的设置。
           设为「关」时，开盖瞬间屏幕亮一下后会自动重新关掉。
-        • 显示器列表可单独关闭/开启任意外接显示器；
+        • 显示器列表中展开任一显示器（含内置屏）即可单独关闭/开启；
           最后一块可见屏幕永远无法被关闭。
         • 没外接显示器时不会关闭内置屏；拔掉外接会自动恢复。
         • 退出 App 会自动恢复所有被关闭的显示器。

@@ -10,7 +10,7 @@
 #   日志默认写到 ~/ws_diag_<时间>.tsv，可用环境变量 LOG=路径 覆盖。
 # 停止:
 #   Ctrl-C，或 kill 掉本进程。
-# 长期后台运行（关掉终端/Claude 也继续）:
+# 长期后台运行（关掉终端也继续）:
 #   nohup ./diagnose_windowserver.sh 60 >/tmp/ws_diag.out 2>&1 &
 
 set -u

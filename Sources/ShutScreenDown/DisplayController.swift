@@ -167,6 +167,7 @@ final class DisplayController {
 
     enum Result: Equatable {
         case ok
+        case alreadyInState       // 已处于目标状态（重复操作），调用方据此给出友好提示
         case apiMissing
         case noBuiltin
         case noExternal           // 已废弃，保留枚举值以兼容日志（现由 wouldBlackout 统一拦截）
@@ -175,11 +176,13 @@ final class DisplayController {
         case configureFailed(Int32)
         case completeFailed(Int32)
 
-        var isSuccess: Bool { self == .ok }
+        /// 目标状态已达成（含「本来就是该状态」）即视为成功
+        var isSuccess: Bool { self == .ok || self == .alreadyInState }
 
         var message: String {
             switch self {
             case .ok:                   return "成功"
+            case .alreadyInState:       return "当前已是该状态"
             case .apiMissing:           return "当前系统不支持该接口"
             case .noBuiltin:            return "未找到内置显示器"
             case .noExternal:           return "没有外接显示器，已拒绝（否则会全黑）"
@@ -219,6 +222,8 @@ final class DisplayController {
     @discardableResult
     func disable(display: CGDirectDisplayID) -> Result {
         guard let fn = configureEnabled else { return .apiMissing }
+        // 已熄灭：直接返回，不提交事务（重复提交会被系统以 CGError 1001 拒绝）
+        if CGDisplayIsActive(display) == 0 { return .alreadyInState }
         guard !wouldLeaveNoVisibleScreen(display) else { return .wouldBlackout }
         return apply(fn, display: display, enabled: false)
     }
@@ -227,7 +232,18 @@ final class DisplayController {
     @discardableResult
     func enable(display: CGDirectDisplayID) -> Result {
         guard let fn = configureEnabled else { return .apiMissing }
+        // 已点亮：直接返回，不提交事务
+        if CGDisplayIsActive(display) != 0 { return .alreadyInState }
         return apply(fn, display: display, enabled: true)
+    }
+
+    /// 把「启用」写回会话配置。用于「采纳系统已点亮的现实状态」——
+    /// 必须真正提交事务（不能走「已在目标状态」短路），否则会话配置里仍留着
+    /// 旧的禁用记录，唤醒过渡期被系统重放时屏幕会再次熄灭。
+    @discardableResult
+    func writeBackEnabled(display: CGDirectDisplayID) -> Result {
+        guard let fn = configureEnabled else { return .apiMissing }
+        return commit(fn, display: display, enabled: true)
     }
 
     /// 批量恢复多台显示器（单次配置事务，避免 N 次 commit 造成 N 次全屏闪烁）。
@@ -235,20 +251,25 @@ final class DisplayController {
     func enableAll(displays: [CGDirectDisplayID]) -> Result {
         guard let fn = configureEnabled else { return .apiMissing }
         guard !displays.isEmpty else { return .ok }
+
         var config: CGDisplayConfigRef?
         let begin = CGBeginDisplayConfiguration(&config)
         if begin != .success { return .beginFailed(begin.rawValue) }
         for d in displays {
             let e = fn(config, d, true)
             if e != .success {
-                // 1001 且已处于启用状态 = 无操作成功，继续处理其余显示器
-                if e.rawValue == 1001 && CGDisplayIsActive(d) != 0 { continue }
+                // 已处于启用状态：跳过即可，不中止事务
+                if CGDisplayIsActive(d) != 0 { continue }
                 CGCancelDisplayConfiguration(config)
                 return .configureFailed(e.rawValue)
             }
         }
         let complete = CGCompleteDisplayConfiguration(config, .forSession)
-        if complete != .success { return .completeFailed(complete.rawValue) }
+        if complete != .success {
+            // 以现实为准：complete 步可能间歇性报错而操作实际已生效
+            if displays.allSatisfy({ CGDisplayIsActive($0) != 0 }) { return .ok }
+            return .completeFailed(complete.rawValue)
+        }
         return .ok
     }
 
@@ -266,9 +287,25 @@ final class DisplayController {
         return enable(display: builtin)
     }
 
+    /// 目标状态是否已达成（以现实为准）。
+    private func targetReached(_ display: CGDirectDisplayID, _ enabled: Bool) -> Bool {
+        enabled ? (CGDisplayIsActive(display) != 0) : (CGDisplayIsActive(display) == 0)
+    }
+
     private func apply(_ fn: ConfigureDisplayEnabledFn,
                        display: CGDirectDisplayID,
                        enabled: Bool) -> Result {
+        let result = commit(fn, display: display, enabled: enabled)
+        // 以现实为准：complete 步在系统重配置期间会间歇性返回 1001，
+        // 而操作实际已生效（实测该错误既出现在重复操作、也出现在正常切换）。
+        if targetReached(display, enabled) { return .ok }
+        return result
+    }
+
+    /// 提交一次显示配置事务。
+    private func commit(_ fn: ConfigureDisplayEnabledFn,
+                        display: CGDirectDisplayID,
+                        enabled: Bool) -> Result {
         var config: CGDisplayConfigRef?
         let begin = CGBeginDisplayConfiguration(&config)
         if begin != .success { return .beginFailed(begin.rawValue) }
@@ -276,11 +313,6 @@ final class DisplayController {
         let e = fn(config, display, enabled)
         if e != .success {
             CGCancelDisplayConfiguration(config)
-            // macOS 26 实测：对「已处于目标状态」的显示器执行配置返回 CGError 1001
-            // （对已禁用的屏再禁用、对已启用的屏再启用）。此时目标状态已达成，视为成功。
-            let alreadyThere = enabled ? (CGDisplayIsActive(display) != 0)
-                                       : (CGDisplayIsActive(display) == 0)
-            if e.rawValue == 1001 && alreadyThere { return .ok }
             return .configureFailed(e.rawValue)
         }
 
