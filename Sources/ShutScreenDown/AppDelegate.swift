@@ -61,6 +61,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
+        // 关闭系统的「自动启用」：默认行为会忽略手写的 isEnabled，按其自己的规则
+        // 判定菜单项是否可用（曾导致本该置灰的项仍可点击）。关掉后完全由代码掌控。
+        menu.autoenablesItems = false
         statusItem.menu = menu
 
         monitor.onChange = { [weak self] in self?.evaluate("显示事件") }
@@ -500,36 +503,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastMenuSignature = signature
         menu.removeAllItems()
 
-        let hasExt = controller.hasExternalDisplay()
-        let builtinActive = controller.isBuiltinActive()
-        let lid = LidState.isClosed()
         let s = store.state
 
-        // —— 状态信息 ——
-        let statusText: String
-        if !controller.isAPIAvailable {
-            statusText = "⚠︎ 当前系统不支持"
-        } else if s.intentDisabled && !builtinActive {
-            statusText = "内置屏：已关闭（仅外接）"
-        } else if s.intentDisabled {
-            statusText = "内置屏：关闭中（等待系统确认）"
-        } else {
-            statusText = "内置屏：开启中"
-        }
-        addInfo(menu, statusText)
-        addInfo(menu, hasExt ? "外接显示器：\(controller.externalDisplays().count) 台已连接"
-                             : "外接显示器：未连接")
-        let lidText: String
-        switch lid {
-        case .some(true):  lidText = "盖子：关闭"
-        case .some(false): lidText = "盖子：打开"
-        case nil:          lidText = "盖子：未知"
-        }
-        addInfo(menu, lidText)
-        menu.addItem(.separator())
-
         // —— 显示器列表 ——
-        addInfo(menu, "显示器：")
         // 内置屏行：与外接屏行同构，展开子菜单可单独开关（无内置屏的机型如 Mac mini 不显示此行）
         if controller.builtinDisplay() != nil {
             menu.addItem(builtinMenuItem(state: s))
@@ -582,12 +558,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
     }
 
-    private func addInfo(_ menu: NSMenu, _ title: String) {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        menu.addItem(item)
-    }
-
     /// 内置显示器行：与外接屏行同构，子菜单提供关闭/开启动作。
     private func builtinMenuItem(state s: AppState) -> NSMenuItem {
         let active = controller.isBuiltinActive()
@@ -600,6 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .map { !controller.wouldLeaveNoVisibleScreen($0) } ?? false
 
         let sub = NSMenu()
+        sub.autoenablesItems = false   // 置灰状态完全由代码掌控（见主菜单同名设置）
         let offItem = NSMenuItem(title: "关闭内置屏", action: #selector(disable), keyEquivalent: "d")
         offItem.target = self
         offItem.isEnabled = active && canDisable && controller.isAPIAvailable
@@ -633,6 +604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.toolTip = inSet ? "意图：关闭" : (active ? "已开启" : "系统未点亮")
 
         let sub = NSMenu()
+        sub.autoenablesItems = false   // 置灰状态完全由代码掌控（见主菜单同名设置）
         let offItem = NSMenuItem(title: "关闭此显示器", action: #selector(extDisable(_:)), keyEquivalent: "")
         offItem.target = self
         offItem.representedObject = d
